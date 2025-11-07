@@ -6,6 +6,7 @@ from time import sleep
 import pandas as pd # Cần thư viện này để dễ dàng xuất ra CSV
 import json
 from datetime import datetime
+import os
 
 # Import giả định cho các dependencies bên ngoài
 # Bạn cần đảm bảo các dependency này đã được cài đặt và hàm send_request hoạt động.
@@ -17,7 +18,7 @@ def send_request(method: str, url: str):
         return requests.get(url, timeout=10) 
     raise NotImplementedError(f"Method {method} not implemented")
 
-USD_TO_VND = 24000
+USD_TO_VND = 26088
 
 #################################################
 
@@ -38,17 +39,8 @@ class PageProcessor():
             recursive [bool]: Enable processing pages recursively.
 
         Yields:
-            job_url [str]: URL for job detail pages.
-
-        Usage: 
-            detail_url_gen = PageProcessor().get_job_detail_urls(
-                <job_listing_url>,
-                ...
-            )
-            for job_url in detail_url_gen:
-                do something 
+            job_url [dict]: job metadata including URL, company, title, etc.
         """
-        # Send requests and parse job details page and gather job data
         print("Scraping job URLs at", url)
         try:
             response = send_request("get", url)
@@ -57,24 +49,65 @@ class PageProcessor():
             return
             
         soup = BeautifulSoup(response.content, "html.parser")
-        jobs_in_page = soup.find_all("div", "job-item-2")
+        jobs_in_page = soup.find_all("div", class_="job-item-2")
+
         for job in jobs_in_page:
-            # Dùng .get("href") để tránh KeyError nếu 'href' không tồn tại
-            link_tag = job.find("a", target = "_blank")
-            if link_tag and link_tag.get("href"):
-                job_url = link_tag["href"]
-                yield job_url
-            else:
-                print("Warning: Job item found without a valid link.")
+            # URL công việc
+            link_tag = job.find("a", target="_blank")
+            job_url = link_tag["href"] if link_tag and link_tag.get("href") else None
+            if not job_url:
+                continue
+
+            # --- Crawl thêm dữ liệu ---
+            title_tag = job.find("h3", class_="title")
+            job_title = title_tag.get_text(strip=True) if title_tag else "N/A"
+
+            salary_tag = job.find("label", class_="title-salary")
+            salary_text = salary_tag.get_text(strip=True) if salary_tag else "N/A"
+
+            company_tag = job.find("a", class_="company")
+            company_name = company_tag.get_text(strip=True) if company_tag else "N/A"
+            company_link = company_tag.get("href") if company_tag else None
+
+            updated_tag = job.find("label", class_="deadline")
+            updated_at = updated_tag.get_text(strip=True) if updated_tag else "N/A"
+
+            time_left_tag = job.find("label", class_="time")
+            time_left = (
+                time_left_tag.get_text(strip=True)
+                if time_left_tag else "N/A"
+            )
+
+            # Lấy toàn bộ các tag kỹ năng
+            tag_elements = job.find_all("label", class_="item")
+            tags = [t.get_text(strip=True) for t in tag_elements] if tag_elements else []
+
+            location_tag = job.find("label", class_="address")
+            location = location_tag.get_text(strip=True).replace("\n", " ") if location_tag else "N/A"
+
+            # Gộp dữ liệu để trả về
+            meta_data = {
+                "job_url": job_url,
+                "job_title": job_title,
+                "salary_text": salary_text,
+                "company_name": company_name,
+                "company_link": company_link,
+                "updated_at": updated_at,
+                "time_left": time_left,
+                "tags": ", ".join(tags),
+                "location": location
+            }
+
+            yield meta_data
 
         # Process next page if found
-        next_page_tag = soup.find("a", rel = "next")
-        if next_page_tag and next_page_tag.get("href"):
+        next_page_tag = soup.find("a", rel="next")
+        if next_page_tag and next_page_tag.get("href") and recursive:
             next_page_url = next_page_tag["href"]
-            if next_page_url and recursive:
-                print("Page finished. Moving on to next page.")
-                for job_url in self.generate_page_urls(next_page_url, recursive):
-                    yield job_url
+            print("Page finished. Moving on to next page.")
+            for job_data in self.generate_page_urls(next_page_url, recursive):
+                yield job_data
+
         print("Page finished. Crawl ended.")
 
 
@@ -127,7 +160,7 @@ class JobProcessor():
             processor = keyword_map[keyword]
         except KeyError:
             raise ValueError(f"Strange URL syntax detected (keyword: {keyword}). \
-Wrong URL input or parsing for this page has not been implemented.")
+                Wrong URL input or parsing for this page has not been implemented.")
         
         # Process job based on newly assigned processor
         sleep(pause_between_jobs)
@@ -229,6 +262,19 @@ class _NormalJobProcessor(JobProcessor):
         company_tag = soup \
             .find("h2", class_ = "company-name-label")
         company_link = company_tag.find("a") if company_tag else None
+        # company = "N/A"
+        # possible_tags = [
+        #     soup.find("h2", class_="company-name-label"),
+        #     soup.find("div", class_="company-name-label"),
+        #     soup.find("p", class_="company-name"),
+        #     soup.find("a", class_="company-name-label"),  # phòng trường hợp link đứng riêng
+        # ]
+        # for tag in possible_tags:
+        #     if tag:
+        #         a_tag = tag.find("a") if tag.name != "a" else tag
+        #         if a_tag and a_tag.text.strip():
+        #             company = a_tag.text.strip()
+        #             break
         
         salary_tag = detail_tags[0] if len(detail_tags) > 0 else None
         xp_tag = detail_tags[2] if len(detail_tags) > 2 else None
@@ -412,27 +458,37 @@ class _BrandJobProcessor(JobProcessor):
             "jd": jd
         }
 
-# --- Các hàm mới để lưu file ---
-
+# --- == SAVE == ---
 def save_to_csv(data: list[dict], filename: str):
-    """Lưu danh sách dictionaries ra tệp CSV."""
+    """Lưu danh sách dictionaries ra tệp CSV trong thư mục data/yyyy-mm-dd/."""
     try:
-        # Chuyển danh sách dicts sang DataFrame
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        data_dir = os.path.join(base_dir, "data", date_str)
+        os.makedirs(data_dir, exist_ok=True)
+
+        filepath = os.path.join(data_dir, filename)
+
         df = pd.DataFrame(data)
-        
-        # Chuyển đổi đối tượng datetime/date sang chuỗi định dạng
         for col in df.select_dtypes(include=['datetime64[ns]']).columns:
             df[col] = df[col].dt.strftime('%Y-%m-%d')
-            
-        df.to_csv(filename, index=False, encoding='utf-8-sig') # Dùng utf-8-sig để hỗ trợ tiếng Việt tốt hơn
-        print(f"✅ Data successfully saved to **{filename}** (CSV).")
+
+        df.to_csv(filepath, index=False, encoding='utf-8-sig')
+        print(f"✅ Data successfully saved to {filepath}")
     except Exception as e:
         print(f"❌ Error saving data to CSV: {e}")
 
+
 def save_to_json(data: list[dict], filename: str):
-    """Lưu danh sách dictionaries ra tệp JSON."""
+    """Lưu danh sách dictionaries ra tệp JSON trong thư mục data/yyyy-mm-dd/."""
     try:
-        # Chuẩn bị dữ liệu: Chuyển đổi các đối tượng datetime thành chuỗi
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        data_dir = os.path.join(base_dir, "data", date_str)
+        os.makedirs(data_dir, exist_ok=True)
+
+        filepath = os.path.join(data_dir, filename)
+
         serializable_data = []
         for item in data:
             new_item = {}
@@ -442,63 +498,113 @@ def save_to_json(data: list[dict], filename: str):
                 else:
                     new_item[k] = v
             serializable_data.append(new_item)
-            
-        with open(filename, 'w', encoding='utf-8') as f:
+
+        with open(filepath, 'w', encoding='utf-8') as f:
             json.dump(serializable_data, f, ensure_ascii=False, indent=4)
-        print(f"✅ Data successfully saved to **{filename}** (JSON).")
+        print(f"✅ Data successfully saved to {filepath}")
     except Exception as e:
         print(f"❌ Error saving data to JSON: {e}")
 
-# --- Điểm khởi đầu để chạy toàn bộ chương trình ---
-
+# -- MAIN --
 def main():
-    """
-    Main function to orchestrate the job scraping process.
-    """
-    # Thay thế bằng URL trang danh sách công việc thực tế của bạn
-    start_url = "https://www.topcv.vn/viec-lam-it?page=2" 
-    
-    # Khởi tạo các processor
+    page_number = 27
+    start_url = f"https://www.topcv.vn/viec-lam-it?page={page_number}"
+
     page_processor = PageProcessor()
     job_processor = JobProcessor()
-    
     crawled_jobs = []
-    
+
     print("--- Starting Job Crawler ---")
-    
-    # Bắt đầu tạo URL chi tiết
-    # Đặt recursive=True nếu bạn muốn crawl tất cả các trang
-    detail_url_generator = page_processor.generate_page_urls(start_url, recursive=False)  # recursive=False
-    
-    for job_url in detail_url_generator:
+
+    # detail_url_generator = page_processor.generate_page_urls(start_url, recursive=False)
+
+    # for job_url in detail_url_generator:
+    #     try:
+    #         job_data = job_processor.process_job(job_url, pause_between_jobs=3)
+    #         crawled_jobs.append(job_data)
+    #         print(f"✅ Successfully scraped: {job_data['job_title']} at {job_data['company']}")
+    #     except Exception as e:
+    #         print(f"⚠️ Failed to process job URL {job_url}: {e}")
+
+
+    detail_url_generator = page_processor.generate_page_urls(start_url, recursive=False)
+
+    for job_meta in detail_url_generator:
         try:
-            # Xử lý từng URL chi tiết với khoảng nghỉ 1 giây giữa các job
-            job_data = job_processor.process_job(job_url, pause_between_jobs=1)
+            job_url = job_meta["job_url"]
+            job_data = job_processor.process_job(job_url, pause_between_jobs=3)
+
+            # Gộp dữ liệu từ page listing và chi tiết
+            job_data.update(job_meta)
+
             crawled_jobs.append(job_data)
-            print(f"Successfully scraped: {job_data['job_title']} at {job_data['company']}")
-        except (ValueError, requests.exceptions.RequestException, Exception) as e:
-            print(f"Failed to process job URL {job_url}: {e}")
-            
+            print(f"✅ Successfully scraped: {job_data['job_title']} at {job_data['company']}")
+        except Exception as e:
+            print(f"⚠️ Failed to process job URL {job_meta.get('job_url')}: {e}")
+
     print(f"\n--- Crawling Finished ---")
     print(f"Total jobs crawled: {len(crawled_jobs)}")
-    # print(crawled_jobs) # In ra kết quả nếu cần
-    # --- PHẦN MỚI: LƯU DỮ LIỆU ---
-    
+
     if crawled_jobs:
-        # Lấy timestamp để đặt tên file
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        # 1. Lưu dưới dạng CSV
-        save_to_csv(crawled_jobs, f"job_data_{timestamp}.csv")
-        
-        # 2. Lưu dưới dạng JSON
-        save_to_json(crawled_jobs, f"job_data_{timestamp}.json")
+        save_to_csv(crawled_jobs, f"job_data_page_{page_number}.csv")
+        save_to_json(crawled_jobs, f"job_data_page_{page_number}.json")
     else:
         print("No data was crawled to save.")
 
-# Chỉ chạy main khi script được thực thi trực tiếp
+# ---------------------------------------------------------------------------------------------------------------        
+# # -- MAIN --
+# def main():
+#     # Định nghĩa phạm vi các trang muốn crawl (ví dụ: từ 22 đến 31, tổng cộng 10 trang) 27 32 33
+#     start_page = 26
+#     end_page = 33 # Sẽ crawl đến trang này (bao gồm cả trang này)
+    
+#     page_range = range(start_page, end_page + 1)
+    
+#     # URL cơ bản để tạo link cho từng trang
+#     base_url = "https://www.topcv.vn/viec-lam-it?page="
+
+#     page_processor = PageProcessor()
+#     job_processor = JobProcessor()
+#     all_crawled_jobs = [] # Danh sách lớn chứa dữ liệu của tất cả các trang
+    
+#     print("--- Starting Job Crawler for multiple pages ---")
+
+#     for page_number in page_range:
+#         current_url = f"{base_url}{page_number}"
+#         print(f"\n🚀 Processing Page: {page_number} at {current_url}")
+        
+#         detail_url_generator = page_processor.generate_page_urls(current_url, recursive=False)
+#         jobs_in_page = 0
+
+#         for job_meta in detail_url_generator:
+#             try:
+#                 job_url = job_meta["job_url"]
+#                 # Đặt pause_between_jobs là 1 hoặc 2 để giảm thời gian chờ, nhưng vẫn đảm bảo an toàn.
+#                 job_data = job_processor.process_job(job_url, pause_between_jobs=2) 
+
+#                 # Gộp dữ liệu từ page listing và chi tiết
+#                 job_data.update(job_meta)
+
+#                 all_crawled_jobs.append(job_data)
+#                 jobs_in_page += 1
+#                 print(f"✅ Successfully scraped job #{jobs_in_page} in page {page_number}: {job_data['job_title']} at {job_data['company']}")
+#             except Exception as e:
+#                 print(f"⚠️ Failed to process job URL {job_meta.get('job_url')}: {e}")
+
+#     print(f"\n--- Crawling Finished ---")
+#     print(f"Total pages crawled: {len(page_range)}")
+#     print(f"Total jobs crawled: {len(all_crawled_jobs)}")
+
+#     if all_crawled_jobs:
+#         # Lưu file với tên tổng hợp cả phạm vi trang
+#         filename_prefix = f"job_data_pages_{start_page}_to_{end_page}"
+#         save_to_csv(all_crawled_jobs, f"{filename_prefix}.csv")
+#         save_to_json(all_crawled_jobs, f"{filename_prefix}.json")
+#     else:
+#         print("No data was crawled to save.")
+
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        print(f"An unexpected error occurred in main execution: {e}")
+        print(f"🚨 Unexpected error in main: {e}")
